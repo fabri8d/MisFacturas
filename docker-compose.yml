@@ -1,0 +1,37 @@
+services:
+  misfacturas-backend:
+    image: fabribiondi2002/misfacturas-backend:latest
+    container_name: misfacturas-backend
+    restart: unless-stopped
+    volumes:
+      - ./data:/data
+    env_file: .env
+    networks:
+      - infra_default
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  misfacturas-frontend:
+    image: fabribiondi2002/misfacturas-frontend:latest
+    container_name: misfacturas-frontend
+    restart: unless-stopped
+    networks:
+      - infra_default
+
+  misfacturas-watchtower:
+    image: containrrr/watchtower
+    container_name: misfacturas-watchtower
+    restart: unless-stopped
+    environment:
+      - DOCKER_API_VERSION=1.40
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    # Solo vigila los contenedores de MisFacturas (no interfiere con el watchtower del portfolio)
+    command: --interval 300 misfacturas-backend misfacturas-frontend
+
+networks:
+  infra_default:
+    external: true

@@ -13,20 +13,20 @@ describe('StatCard', () => {
     expect(wrapper.text()).toMatch(/5[\.,\s]?000/)
   })
 
-  it('applies success variant class', () => {
+  it('applies text-success class for success variant', () => {
     const wrapper = mount(StatCard, { props: { label: 'X', amount: 0, variant: 'success' } })
-    expect(wrapper.find('.stat-card').classes()).toContain('success')
+    expect(wrapper.html()).toContain('text-success')
   })
 
-  it('applies danger variant class', () => {
+  it('applies text-error class for danger variant', () => {
     const wrapper = mount(StatCard, { props: { label: 'X', amount: 0, variant: 'danger' } })
-    expect(wrapper.find('.stat-card').classes()).toContain('danger')
+    expect(wrapper.html()).toContain('text-error')
   })
 
-  it('defaults to no variant class', () => {
+  it('no color class for default variant', () => {
     const wrapper = mount(StatCard, { props: { label: 'X', amount: 0 } })
-    const classes = wrapper.find('.stat-card').classes()
-    expect(classes).not.toContain('success')
-    expect(classes).not.toContain('danger')
+    const html = wrapper.html()
+    expect(html).not.toContain('text-success')
+    expect(html).not.toContain('text-error')
   })
 })

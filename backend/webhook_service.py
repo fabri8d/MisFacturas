@@ -1,7 +1,8 @@
-"""Servicio de webhooks salientes de MisFacturas.
+"""Servicio de webhooks salientes de MisFacturas v2.
 
 Envía eventos a una URL configurada por el usuario con firma HMAC-SHA256 opcional.
-Nunca lanza excepciones — todos los errores se loguean y se guardan en el log.
+Nunca lanza excepciones — todos los errores se loguean.
+Soporta webhooks por usuario (url/secret desde profile de Supabase) y global (env vars).
 """
 
 import hashlib
@@ -10,35 +11,32 @@ import json
 import logging
 import os
 from datetime import datetime, timezone
+from typing import Optional
 
 import httpx
 
-import storage
-
 logger = logging.getLogger(__name__)
 
-WEBHOOK_LOG = os.getenv("WEBHOOK_LOG", "/data/webhook_log.json")
-_MAX_LOG_ENTRIES = 10
 
-
-async def fire(event_type: str, payload: dict) -> None:
+async def fire(
+    event_type: str,
+    payload: dict,
+    *,
+    url: Optional[str] = None,
+    secret: Optional[str] = None,
+    user_id: Optional[str] = None,
+) -> None:
     """Dispara un webhook saliente para el evento dado.
 
-    Args:
-        event_type: Nombre del evento (p. ej. "bill.created").
-        payload: Datos específicos del evento.
+    Si url/secret no se pasan, se leen de WEBHOOK_URL/WEBHOOK_SECRET env vars.
+    Si user_id se pasa, el resultado se loguea en la tabla webhook_logs de Supabase.
     """
-    status_code: int | None = None
-    error: str | None = None
+    status_code: Optional[int] = None
+    error: Optional[str] = None
 
     try:
-        # Env vars tienen prioridad; bills.json meta como fallback legacy
-        webhook_url = os.getenv("WEBHOOK_URL", "").strip()
-        webhook_secret = os.getenv("WEBHOOK_SECRET", "").strip()
-        if not webhook_url:
-            meta = storage.read_bills().get("meta", {})
-            webhook_url = meta.get("webhook_url", "").strip()
-            webhook_secret = webhook_secret or meta.get("webhook_secret", "").strip()
+        webhook_url = (url or "").strip() or os.getenv("WEBHOOK_URL", "").strip()
+        webhook_secret = (secret or "").strip() or os.getenv("WEBHOOK_SECRET", "").strip()
 
         if not webhook_url:
             return
@@ -66,19 +64,24 @@ async def fire(event_type: str, payload: dict) -> None:
         logger.error("[WEBHOOK] %s → ERROR: %s", event_type, error)
 
     finally:
-        _append_log(event_type, status_code, error)
+        if user_id:
+            _append_supabase_log(event_type, status_code, error, user_id)
 
 
-def _append_log(event_type: str, status_code: int | None, error: str | None) -> None:
-    """Agrega una entrada al webhook_log.json y mantiene solo las últimas 10."""
-    entry = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "event": event_type,
-        "status_code": status_code,
-        "error": error,
-    }
-    log = storage.read_json(WEBHOOK_LOG, default=[])
-    if not isinstance(log, list):
-        log = []
-    log.append(entry)
-    storage.write_json(WEBHOOK_LOG, log[-_MAX_LOG_ENTRIES:])
+def _append_supabase_log(
+    event_type: str,
+    status_code: Optional[int],
+    error: Optional[str],
+    user_id: str,
+) -> None:
+    """Registra el resultado del webhook en la tabla webhook_logs de Supabase."""
+    try:
+        from supabase_client import supabase
+        supabase.table("webhook_logs").insert({
+            "user_id": user_id,
+            "event": event_type,
+            "status_code": status_code,
+            "error": error,
+        }).execute()
+    except Exception as exc:
+        logger.error("[WEBHOOK] Error al guardar log en Supabase: %s", exc)

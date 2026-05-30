@@ -1,19 +1,34 @@
 /**
- * Cliente HTTP de MisFacturas.
- * Instancia de Axios con baseURL desde la variable de entorno VITE_API_BASE_URL.
- * El interceptor de respuesta desenvuelve data y normaliza los errores.
+ * Cliente HTTP de MisFacturas v2.
+ * Agrega el JWT de Supabase en cada request.
+ * Si el servidor responde 401, cierra la sesión y redirige al login.
  */
 import axios from 'axios'
+import { useAuth } from '../composables/useAuth'
+import router from '../router/index'
 
 const client = axios.create({
   baseURL: import.meta.env.VITE_API_BASE_URL || '/api',
 })
 
+client.interceptors.request.use(async (config) => {
+  const { getAccessToken } = useAuth()
+  const token = await getAccessToken()
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`
+  }
+  return config
+})
+
 client.interceptors.response.use(
   (response) => response.data,
-  (error) => {
+  async (error) => {
+    if (error.response?.status === 401) {
+      const { signOut } = useAuth()
+      await signOut()
+      router.push('/login')
+    }
     const detail = error.response?.data?.detail
-    // detail puede ser string o un objeto {message, existing} (ej. 409 duplicado)
     const message = typeof detail === 'object' ? detail : (detail || error.message || 'Error desconocido')
     const status = error.response?.status ?? 0
     return Promise.reject({ message, status })

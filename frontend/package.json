@@ -1,6 +1,6 @@
 {
   "name": "misfacturas",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
   "scripts": {
     "dev": "vite",
@@ -14,17 +14,21 @@
     "test": "vitest run && playwright test"
   },
   "dependencies": {
+    "@mdi/font": "^7.4.47",
+    "@supabase/supabase-js": "^2.46.0",
     "axios": "^1.7.9",
     "pinia": "^2.2.6",
     "vue": "^3.5.13",
-    "vue-router": "^4.5.0"
+    "vue-router": "^4.5.0",
+    "vuetify": "^3.7.0"
   },
   "devDependencies": {
     "@playwright/test": "^1.49.1",
-    "@vue/test-utils": "^2.4.6",
     "@vitejs/plugin-vue": "^5.2.1",
+    "@vue/test-utils": "^2.4.6",
     "jsdom": "^26.0.0",
     "vite": "^6.0.5",
+    "vite-plugin-vuetify": "^2.0.4",
     "vitest": "^2.1.8"
   }
 }

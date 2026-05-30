@@ -1,12 +1,58 @@
+<template>
+  <v-list-item
+    rounded="lg"
+    border
+    class="mb-2 py-2"
+    :ripple="false"
+  >
+    <template #prepend>
+      <v-avatar :color="avatarBg" size="38" class="me-2">
+        <span style="font-size: 1.1rem">{{ cat.emoji }}</span>
+      </v-avatar>
+    </template>
+
+    <v-list-item-title class="text-body-2 font-weight-medium">
+      {{ bill.name }}
+    </v-list-item-title>
+    <v-list-item-subtitle class="text-caption">
+      {{ fmtDate(bill.dueDate) }}
+      <template v-if="bill.notes"> · {{ bill.notes }}</template>
+    </v-list-item-subtitle>
+
+    <template #append>
+      <div class="d-flex flex-column align-end" style="gap:4px; min-width: 90px">
+        <span class="text-body-2 font-weight-bold">{{ fmt(bill.amount) }}</span>
+        <v-chip :color="chipColor" variant="tonal" size="x-small">
+          {{ status.label }}
+        </v-chip>
+        <div v-if="showActions" class="d-flex" style="gap:2px; margin-top:2px">
+          <v-btn
+            icon="mdi-pencil-outline"
+            variant="text"
+            size="x-small"
+            @click.stop="emit('edit')"
+          />
+          <v-btn
+            icon="mdi-delete-outline"
+            variant="text"
+            size="x-small"
+            color="error"
+            @click.stop="emit('delete')"
+          />
+        </div>
+      </div>
+      <v-checkbox-btn
+        :model-value="bill.isPaid"
+        color="success"
+        class="ms-3 flex-shrink-0"
+        hide-details
+        @update:model-value="emit('toggle')"
+      />
+    </template>
+  </v-list-item>
+</template>
+
 <script setup>
-/**
- * BillRow — Fila de factura con estado visual y acciones.
- * @prop {Object}  bill       - Objeto factura
- * @prop {boolean} showActions - Muestra botones editar/eliminar
- * @emit {void} toggle  - Solicita alternar estado de pago
- * @emit {void} edit    - Solicita navegar a edición
- * @emit {void} delete  - Solicita eliminar
- */
 import { computed } from 'vue'
 import { CATEGORIES } from '../constants/categories'
 
@@ -25,92 +71,28 @@ const fmtDate = (s) => {
   return `${d}/${m}/${y}`
 }
 
-/** Estado calculado a partir de isPaid y dueDate */
 const status = computed(() => {
-  if (props.bill.isPaid) return { label: 'Pagada', cls: 'paid' }
+  if (props.bill.isPaid) return { label: 'Pagada', key: 'paid' }
   const today = new Date().toISOString().slice(0, 10)
-  if (props.bill.dueDate < today) return { label: 'Vencida', cls: 'overdue' }
-  const diffDays = Math.ceil(
-    (new Date(props.bill.dueDate) - new Date(today)) / 86400000,
-  )
-  if (diffDays <= 3) return { label: 'Urgente', cls: 'urgent' }
-  return { label: 'Pendiente', cls: 'pending' }
+  if (props.bill.dueDate < today) return { label: 'Vencida', key: 'overdue' }
+  const diffDays = Math.ceil((new Date(props.bill.dueDate) - new Date(today)) / 86400000)
+  if (diffDays <= 3) return { label: 'Urgente', key: 'urgent' }
+  return { label: 'Pendiente', key: 'pending' }
 })
+
+const chipColor = computed(() => ({
+  paid:    'success',
+  overdue: 'error',
+  urgent:  'warning',
+  pending: 'default',
+}[status.value.key]))
+
+const avatarBg = computed(() => ({
+  paid:    'success-lighten-4',
+  overdue: 'error-lighten-4',
+  urgent:  'warning-lighten-4',
+  pending: 'surface-variant',
+}[status.value.key]))
 
 const cat = computed(() => CATEGORIES[props.bill.category] ?? CATEGORIES.otro)
 </script>
-
-<template>
-  <div class="bill-row">
-    <button class="check" :class="status.cls" @click="emit('toggle')" :title="status.label">
-      <span v-if="bill.isPaid">✓</span>
-      <span v-else class="circle" />
-    </button>
-
-    <div class="info">
-      <span class="name">{{ bill.name }}</span>
-      <span class="meta">
-        {{ cat.emoji }} {{ cat.label }} · {{ fmtDate(bill.dueDate) }}
-      </span>
-    </div>
-
-    <div class="right">
-      <span class="amount">{{ fmt(bill.amount) }}</span>
-      <span class="badge" :class="status.cls">{{ status.label }}</span>
-    </div>
-
-    <div v-if="showActions" class="actions">
-      <button class="icon-btn" @click="emit('edit')" title="Editar">✏️</button>
-      <button class="icon-btn danger" @click="emit('delete')" title="Eliminar">🗑️</button>
-    </div>
-  </div>
-</template>
-
-<style scoped>
-.bill-row {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 12px;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  transition: background 0.15s;
-}
-.bill-row:hover { background: var(--surface-2); }
-
-.check {
-  width: 32px; height: 32px;
-  border-radius: 50%;
-  border: 2px solid var(--border);
-  background: transparent;
-  display: flex; align-items: center; justify-content: center;
-  flex-shrink: 0;
-  font-size: 1rem;
-  transition: all 0.15s;
-}
-.check.paid    { border-color: var(--success); color: var(--success); background: rgba(74,222,128,0.1); }
-.check.overdue { border-color: var(--danger);  color: var(--danger); }
-.check.urgent  { border-color: var(--warning); color: var(--warning); }
-.circle { width: 10px; height: 10px; border-radius: 50%; background: var(--border); }
-
-.info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
-.name { font-size: 0.9rem; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.meta { font-size: 0.75rem; color: var(--text-muted); }
-
-.right { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
-.amount { font-size: 0.9rem; font-weight: 600; }
-
-.badge {
-  font-size: 0.65rem; padding: 2px 6px; border-radius: 99px; font-weight: 600;
-}
-.badge.paid    { background: rgba(74,222,128,0.15);  color: var(--success); }
-.badge.overdue { background: rgba(248,113,113,0.15); color: var(--danger); }
-.badge.urgent  { background: rgba(251,191,36,0.15);  color: var(--warning); }
-.badge.pending { background: var(--surface-3); color: var(--text-muted); }
-
-.actions { display: flex; flex-direction: column; gap: 4px; }
-.icon-btn { background: transparent; color: var(--text-muted); font-size: 0.9rem; padding: 4px; border-radius: 6px; }
-.icon-btn:hover { background: var(--surface-3); }
-.icon-btn.danger:hover { color: var(--danger); }
-</style>

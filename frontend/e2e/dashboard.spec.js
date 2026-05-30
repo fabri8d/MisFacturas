@@ -1,47 +1,34 @@
 import { expect, test } from '@playwright/test'
 
-test.describe('Dashboard', () => {
-  test('loads and shows main elements', async ({ page }) => {
+// All dashboard routes require auth. Unauthenticated users are redirected to /login.
+// Full dashboard tests require a real authenticated session (Google OAuth).
+
+test.describe('Dashboard — auth redirect', () => {
+  test('redirects unauthenticated user to /login', async ({ page }) => {
     await page.goto('/')
-    await expect(page.getByText('MisFacturas')).toBeVisible()
-    await expect(page.locator('.month-nav')).toBeVisible()
-    await expect(page.locator('.stat-card')).toHaveCount(3)
+    await page.waitForTimeout(1500)
+    expect(page.url()).toContain('/login')
   })
 
-  test('shows Total, Pagado, Pendiente stat cards', async ({ page }) => {
+  test('login page shows MisFacturas branding', async ({ page }) => {
     await page.goto('/')
-    // Usar .stat-card para evitar ambigüedad con ProgressBar que también tiene "Pagado"
-    await expect(page.locator('.stat-card').filter({ hasText: 'Total' }).first()).toBeVisible()
-    await expect(page.locator('.stat-card').filter({ hasText: 'Pagado' }).first()).toBeVisible()
-    await expect(page.locator('.stat-card').filter({ hasText: 'Pendiente' }).first()).toBeVisible()
+    await page.waitForTimeout(1500)
+    await expect(page.locator('text=MisFacturas')).toBeVisible()
   })
 
-  test('month navigation changes label', async ({ page }) => {
+  test('login page has Google sign-in button', async ({ page }) => {
     await page.goto('/')
-    const label = page.locator('.month-nav .label')
-    const initialText = await label.textContent()
-
-    await page.locator('.month-nav button').first().click()
-    const prevText = await label.textContent()
-    expect(prevText).not.toBe(initialText)
-
-    await page.locator('.month-nav button').last().click()
-    await expect(label).toHaveText(initialText ?? '')
-  })
-
-  test('shows empty state when no bills', async ({ page }) => {
-    await page.goto('/')
-    // Si no hay facturas debe mostrar algún mensaje o la lista vacía
-    const list = page.locator('.list')
-    const emptyMsg = page.locator('.empty')
-    const hasBills = await list.locator('.bill-row').count()
-    if (hasBills === 0) {
-      await expect(emptyMsg.or(page.getByText('No hay facturas'))).toBeVisible()
-    }
-  })
-
-  test('bottom navigation has 4 items', async ({ page }) => {
-    await page.goto('/')
-    await expect(page.locator('.nav-item')).toHaveCount(4)
+    await page.waitForTimeout(1500)
+    const btn = page.getByRole('button', { name: /continuar con google/i })
+    await expect(btn).toBeVisible()
   })
 })
+
+// Notes on authenticated tests (require real Google session):
+//   - MisFacturas title visible in app bar
+//   - MonthNav chip shows current month
+//   - 3 stat cards: Total, Pagado, Pendiente
+//   - ProgressBar visible
+//   - Mobile: v-bottom-navigation with 4 items
+//   - Desktop: v-navigation-drawer visible, bottom nav hidden
+//   - Desktop: 2-column layout with bills left, sidebar right

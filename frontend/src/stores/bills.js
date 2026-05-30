@@ -7,6 +7,8 @@ import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import client from '../api/client'
 
+const currentYearNum = () => new Date().getFullYear()
+
 /** Devuelve YYYY-MM-DD de hoy */
 const todayStr = () => new Date().toISOString().slice(0, 10)
 
@@ -17,6 +19,7 @@ export const useBillsStore = defineStore('bills', () => {
   // ── State ──────────────────────────────────────────────────────────────────
   const bills = ref([])
   const currentMonth = ref(currentMonthStr())
+  const summaryYear = ref(currentYearNum())
   const loading = ref(false)
   const error = ref(null)
 
@@ -70,7 +73,7 @@ export const useBillsStore = defineStore('bills', () => {
     error.value = null
     try {
       const created = await client.post('/bills', payload)
-      bills.value.push(created)
+      await fetchBills()
       return created
     } catch (err) {
       if (err.status === 409) {
@@ -92,8 +95,7 @@ export const useBillsStore = defineStore('bills', () => {
     error.value = null
     try {
       const updated = await client.put(`/bills/${id}`, payload)
-      const idx = bills.value.findIndex((b) => b.id === id)
-      if (idx !== -1) bills.value[idx] = updated
+      await fetchBills()
       return updated
     } catch (err) {
       error.value = err.message
@@ -108,7 +110,7 @@ export const useBillsStore = defineStore('bills', () => {
     error.value = null
     try {
       await client.delete(`/bills/${id}`)
-      bills.value = bills.value.filter((b) => b.id !== id)
+      await fetchBills()
     } catch (err) {
       error.value = err.message
       throw err
@@ -135,8 +137,13 @@ export const useBillsStore = defineStore('bills', () => {
     })
   }
 
-  async function fetchSummary(months = 6) {
-    return client.get('/summary', { params: { months } })
+  async function fetchSummary(year = null) {
+    const params = year ? { year } : { year: summaryYear.value }
+    return client.get('/summary', { params })
+  }
+
+  function setSummaryYear(year) {
+    summaryYear.value = year
   }
 
   // Estado de integraciones (solo lectura, para chips informativos)
@@ -173,6 +180,7 @@ export const useBillsStore = defineStore('bills', () => {
   return {
     bills,
     currentMonth,
+    summaryYear,
     loading,
     error,
     billsForMonth,
@@ -188,6 +196,7 @@ export const useBillsStore = defineStore('bills', () => {
     togglePaid,
     scanInvoice,
     fetchSummary,
+    setSummaryYear,
     fetchNotificationsConfig,
     fetchDriveStatus,
     exportBills,

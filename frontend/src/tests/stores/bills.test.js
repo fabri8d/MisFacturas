@@ -59,6 +59,8 @@ describe('bills store', () => {
   it('createBill adds to state', async () => {
     const newBill = makeBill({ id: 'new-id' })
     client.post.mockResolvedValue(newBill)
+    // fetchBills() called after create — mock to return the new bill
+    client.get.mockResolvedValue([newBill])
 
     const store = useBillsStore()
     await store.createBill({ name: 'EPEC', amount: 1000, dueDate: in10Days, category: 'electricidad' })
@@ -71,6 +73,8 @@ describe('bills store', () => {
     const store = useBillsStore()
     store.bills = [makeBill({ id: 'del-id' })]
     client.delete.mockResolvedValue(undefined)
+    // fetchBills() called after delete — mock to return empty
+    client.get.mockResolvedValue([])
 
     await store.deleteBill('del-id')
     expect(store.bills).toHaveLength(0)

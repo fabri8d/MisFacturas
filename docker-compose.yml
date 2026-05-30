@@ -3,8 +3,6 @@ services:
     image: fabribiondi2002/misfacturas-backend:latest
     container_name: misfacturas-backend
     restart: unless-stopped
-    volumes:
-      - ./data:/data
     env_file: .env
     networks:
       - infra_default

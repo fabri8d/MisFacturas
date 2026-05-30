@@ -1,8 +1,26 @@
+<template>
+  <div class="d-flex align-center justify-center py-3" style="gap:12px">
+    <v-btn
+      icon="mdi-chevron-left"
+      variant="outlined"
+      size="small"
+      aria-label="Mes anterior"
+      @click="shift(-1)"
+    />
+    <v-chip color="primary" variant="tonal" size="default" class="px-4 font-weight-medium text-capitalize">
+      {{ label }}
+    </v-chip>
+    <v-btn
+      icon="mdi-chevron-right"
+      variant="outlined"
+      size="small"
+      aria-label="Mes siguiente"
+      @click="shift(1)"
+    />
+  </div>
+</template>
+
 <script setup>
-/**
- * MonthNav — Navegador de mes con flechas.
- * Lee y escribe currentMonth del store de facturas.
- */
 import { computed } from 'vue'
 import { useBillsStore } from '../stores/bills'
 
@@ -25,36 +43,3 @@ function shift(delta) {
   store.fetchBills()
 }
 </script>
-
-<template>
-  <div class="month-nav">
-    <button @click="shift(-1)" aria-label="Mes anterior">‹</button>
-    <span class="label">{{ label }}</span>
-    <button @click="shift(1)" aria-label="Mes siguiente">›</button>
-  </div>
-</template>
-
-<style scoped>
-.month-nav {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 16px;
-  padding: 8px 0 16px;
-}
-.label { font-size: 1rem; font-weight: 600; text-transform: capitalize; }
-button {
-  background: var(--surface-2);
-  color: var(--text);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  width: 36px;
-  height: 36px;
-  font-size: 1.25rem;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  transition: background 0.15s;
-}
-button:hover { background: var(--surface-3); }
-</style>

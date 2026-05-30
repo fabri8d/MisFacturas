@@ -68,20 +68,15 @@ async def test_webhooks_config_no_url(client):
     assert r.json()["url_set"] is False
 
 
-async def test_webhook_log_rotation(monkeypatch):
-    """El log se mantiene con máximo 10 entradas."""
+async def test_webhook_log_stored_in_supabase(monkeypatch, fake_supabase):
+    """fire() con user_id registra el log en Supabase (v2)."""
     import importlib
     import webhook_service
-    importlib.reload(webhook_service)
+    from unittest.mock import patch as mpatch
+    from tests.conftest import TEST_USER_ID
 
-    # Simular 15 entradas previas
-    import os
-    log_path = os.getenv("WEBHOOK_LOG", "/data/webhook_log.json")
-    existing = [{"timestamp": f"2026-01-{i:02d}T00:00:00Z", "event": "old", "status_code": 200, "error": None} for i in range(1, 16)]
-    storage.write_json(log_path, existing)
-
-    # Disparar una más
     monkeypatch.setenv("WEBHOOK_URL", "https://example.com/hook")
+
     mock_response = MagicMock()
     mock_response.status_code = 200
     mock_client = AsyncMock()
@@ -89,13 +84,17 @@ async def test_webhook_log_rotation(monkeypatch):
     mock_client.__aexit__ = AsyncMock(return_value=False)
     mock_client.post = AsyncMock(return_value=mock_response)
 
-    importlib.reload(webhook_service)
+    with mpatch('supabase_client.supabase', fake_supabase):
+        importlib.reload(webhook_service)
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            await webhook_service.fire("test.event", {"key": "val"}, user_id=TEST_USER_ID)
 
-    with patch("httpx.AsyncClient", return_value=mock_client):
-        await webhook_service.fire("new.event", {})
-
-    log = storage.read_json(log_path, default=[])
-    assert len(log) <= 10
+    # Log entry should have been inserted into webhook_logs table
+    logs = fake_supabase._stores.get("webhook_logs", [])
+    assert len(logs) == 1
+    assert logs[0]["event"] == "test.event"
+    assert logs[0]["user_id"] == TEST_USER_ID
+    assert logs[0]["status_code"] == 200
 
 
 async def test_fire_on_exception_does_not_raise(monkeypatch):

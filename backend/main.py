@@ -1,89 +1,50 @@
-"""MisFacturas — API backend principal.
+"""MisFacturas v2 — API backend principal.
 
-Registra todos los routers bajo el prefijo /api y gestiona el ciclo de vida
-del scheduler de APScheduler dentro del contexto de FastAPI (lifespan).
+Todos los endpoints protegidos requieren JWT de Supabase Auth.
+Bills y configuración se persisten en Supabase PostgreSQL.
 """
 
 import asyncio
+import json
 import logging
 import os
-import uuid
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 from dotenv import load_dotenv
 
-load_dotenv()  # carga .env antes de que los módulos lean variables de entorno
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '.env'))
 
-from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 
 import drive_service
 import groq_service
 import notifier
-import storage
 import webhook_service
+from auth import get_current_user
 from constants import CATEGORIES
 from models import BillCreate, BillResponse, BillUpdate, SummaryItem
+from supabase_client import supabase
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
 
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
-NOTIFICATIONS_LOG = os.getenv("NOTIFICATIONS_LOG", "/data/notifications_log.json")
-WEBHOOK_LOG = os.getenv("WEBHOOK_LOG", "/data/webhook_log.json")
-DRIVE_CONFIG = os.getenv("DRIVE_CONFIG", "/data/drive_config.json")
-DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID", "").strip()
+ALLOWED_SCAN_TYPES = {"image/jpeg", "image/png", "application/pdf"}
+
+_MONTHS_ES = [
+    "enero", "febrero", "marzo", "abril", "mayo", "junio",
+    "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre",
+]
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Gestiona el inicio y cierre del scheduler."""
     notifier.start_scheduler()
-
-    # Auto-configurar carpeta de Drive desde DRIVE_FOLDER_ID si OAuth ya está hecho
-    if DRIVE_FOLDER_ID:
-        try:
-            config = storage.read_json(DRIVE_CONFIG, default={})
-            if config.get("refresh_token") and config.get("watch_folder_id") != DRIVE_FOLDER_ID:
-                logger.info("[MAIN] Configurando carpeta Drive desde env: %s", DRIVE_FOLDER_ID)
-                await drive_service.stop_watch_channel()
-                await drive_service.create_watch_channel(DRIVE_FOLDER_ID)
-        except Exception as exc:
-            logger.warning("[MAIN] Auto Drive folder setup error: %s", exc)
-
-    # Renovar canal de Drive si expira pronto
-    try:
-        config = storage.read_json(DRIVE_CONFIG, default={})
-        expiry_str = config.get("channel_expiry")
-        if expiry_str and config.get("watch_folder_id"):
-            expiry = datetime.fromisoformat(expiry_str)
-            if expiry.tzinfo is None:
-                expiry = expiry.replace(tzinfo=timezone.utc)
-            if expiry < datetime.now(timezone.utc) + timedelta(days=1):
-                asyncio.create_task(drive_service.renew_channel())
-    except Exception as exc:
-        logger.warning("[MAIN] Drive channel check error: %s", exc)
-
-    # Job de renovación de canal cada 6 días
-    try:
-        notifier.scheduler.add_job(
-            drive_service.renew_channel,
-            "interval",
-            days=6,
-            id="drive_channel_renew",
-            replace_existing=True,
-        )
-    except Exception as exc:
-        logger.warning("[MAIN] Drive renew job error: %s", exc)
-
     yield
-
     notifier.stop_scheduler()
 
 
@@ -108,193 +69,306 @@ async def health():
 # ─── Bills CRUD ────────────────────────────────────────────────────────────────
 
 @app.get("/api/bills", response_model=list[BillResponse])
-async def get_bills(month: Optional[str] = Query(None, pattern=r"^\d{4}-\d{2}$")):
-    """Devuelve todas las facturas, opcionalmente filtradas por mes (YYYY-MM), ordenadas por dueDate."""
-    data = storage.read_bills()
-    bills = data.get("bills", [])
+async def get_bills(
+    month: Optional[str] = Query(None, pattern=r"^\d{4}-\d{2}$"),
+    current_user: dict = Depends(get_current_user),
+):
+    uid = current_user["id"]
+    query = supabase.table("bills").select("*").eq("user_id", uid).order("due_date")
     if month:
-        bills = [b for b in bills if b.get("month") == month]
-    bills.sort(key=lambda b: b.get("dueDate", ""))
-    return bills
+        query = query.eq("month", month)
+    resp = query.execute()
+    return [BillResponse.from_supabase(row) for row in resp.data]
 
 
 @app.post("/api/bills/import", status_code=200)
-async def import_bills(file: UploadFile = File(...)):
-    """Reemplaza todas las facturas con el contenido de un bills.json exportado."""
+async def import_bills(
+    file: UploadFile = File(...),
+    current_user: dict = Depends(get_current_user),
+):
+    """Reemplaza todas las facturas del usuario con el contenido de un bills.json exportado."""
+    uid = current_user["id"]
     raw = await file.read()
     try:
-        incoming = __import__("json").loads(raw)
+        incoming = json.loads(raw)
     except Exception:
         raise HTTPException(status_code=400, detail="Archivo JSON inválido")
     if not isinstance(incoming, dict) or "bills" not in incoming:
         raise HTTPException(status_code=400, detail="Formato incorrecto: falta la clave 'bills'")
-    current = storage.read_bills()
-    current["bills"] = incoming["bills"]
-    storage.write_bills(current)
-    return {"ok": True, "imported": len(incoming["bills"])}
+
+    supabase.table("bills").delete().eq("user_id", uid).execute()
+
+    rows = []
+    for b in incoming["bills"]:
+        due = b.get("dueDate") or b.get("due_date")
+        if not due:
+            continue
+        rows.append({
+            "user_id": uid,
+            "name": b.get("name", ""),
+            "category": b.get("category", "otro"),
+            "amount": float(b.get("amount", 0)),
+            "due_date": due,
+            "month": due[:7],
+            "is_paid": bool(b.get("isPaid") or b.get("is_paid", False)),
+            "paid_date": b.get("paidDate") or b.get("paid_date"),
+            "notes": b.get("notes"),
+            "source": b.get("source", "manual"),
+        })
+    if rows:
+        supabase.table("bills").insert(rows).execute()
+    return {"ok": True, "imported": len(rows)}
 
 
 @app.post("/api/bills", response_model=BillResponse, status_code=201)
-async def create_bill(bill: BillCreate):
-    """Crea una nueva factura. id y month se calculan server-side.
+async def create_bill(bill: BillCreate, current_user: dict = Depends(get_current_user)):
+    uid = current_user["id"]
 
-    Retorna HTTP 409 si ya existe una factura con el mismo name/amount/dueDate.
-    """
-    existing = storage.find_duplicate(bill.name, bill.amount, bill.dueDate)
-    if existing:
+    # Deduplicación: mismo nombre (case-insensitive) + amount + due_date para este usuario
+    dup = (
+        supabase.table("bills")
+        .select("*")
+        .eq("user_id", uid)
+        .ilike("name", bill.name)
+        .eq("amount", str(bill.amount))
+        .eq("due_date", bill.due_date)
+        .limit(1)
+        .execute()
+    )
+    if dup.data:
+        existing = BillResponse.from_supabase(dup.data[0])
         raise HTTPException(
             status_code=409,
-            detail={"message": "Ya existe una factura similar", "existing": existing},
+            detail={"message": "Ya existe una factura similar", "existing": existing.model_dump(by_alias=True)},
         )
 
-    data = storage.read_bills()
-    new_bill = {
-        "id": str(uuid.uuid4()),
+    row = {
+        "user_id": uid,
         "name": bill.name,
         "category": bill.category,
         "amount": bill.amount,
-        "dueDate": bill.dueDate,
-        "month": bill.dueDate[:7],
-        "isPaid": bill.isPaid,
-        "paidDate": bill.paidDate if bill.isPaid else None,
+        "due_date": bill.due_date,
+        "month": bill.due_date[:7],
+        "is_paid": bill.is_paid,
+        "paid_date": bill.paid_date if bill.is_paid else None,
         "notes": bill.notes,
         "source": bill.source,
-        "createdAt": datetime.now(timezone.utc).isoformat(),
     }
-    data["bills"].append(new_bill)
-    storage.write_bills(data)
+    resp = supabase.table("bills").insert(row).execute()
+    created = BillResponse.from_supabase(resp.data[0])
 
     asyncio.create_task(
         webhook_service.fire(
             "bill.created",
-            {k: new_bill[k] for k in ("id", "name", "category", "amount", "dueDate", "isPaid", "source")},
+            {"id": created.id, "name": created.name, "category": created.category,
+             "amount": created.amount, "dueDate": created.due_date, "source": created.source},
+            user_id=uid,
         )
     )
-    return new_bill
+    return created
 
 
 @app.put("/api/bills/{bill_id}", response_model=BillResponse)
-async def update_bill(bill_id: str, bill: BillUpdate):
-    """Actualiza los campos enviados de una factura. Devuelve 404 si no existe."""
-    data = storage.read_bills()
-    for idx, b in enumerate(data["bills"]):
-        if b["id"] == bill_id:
-            update = bill.model_dump(exclude_none=True)
-            if "dueDate" in update:
-                update["month"] = update["dueDate"][:7]
-            data["bills"][idx].update(update)
-            storage.write_bills(data)
-            return data["bills"][idx]
-    raise HTTPException(status_code=404, detail="Factura no encontrada")
+async def update_bill(
+    bill_id: str, bill: BillUpdate, current_user: dict = Depends(get_current_user)
+):
+    uid = current_user["id"]
+    check = supabase.table("bills").select("id").eq("id", bill_id).eq("user_id", uid).limit(1).execute()
+    if not check.data:
+        raise HTTPException(status_code=404, detail="Factura no encontrada")
+
+    update = bill.model_dump(exclude_none=True, by_alias=False)
+    if not update:
+        row = supabase.table("bills").select("*").eq("id", bill_id).single().execute()
+        return BillResponse.from_supabase(row.data)
+
+    if "due_date" in update:
+        update["month"] = update["due_date"][:7]
+    update["updated_at"] = datetime.now(timezone.utc).isoformat()
+    resp = supabase.table("bills").update(update).eq("id", bill_id).eq("user_id", uid).execute()
+    return BillResponse.from_supabase(resp.data[0])
 
 
 @app.delete("/api/bills/{bill_id}", status_code=204)
-async def delete_bill(bill_id: str):
-    """Elimina una factura. Devuelve 404 si no existe."""
-    data = storage.read_bills()
-    original_len = len(data["bills"])
-    data["bills"] = [b for b in data["bills"] if b["id"] != bill_id]
-    if len(data["bills"]) == original_len:
+async def delete_bill(bill_id: str, current_user: dict = Depends(get_current_user)):
+    uid = current_user["id"]
+    resp = supabase.table("bills").delete().eq("id", bill_id).eq("user_id", uid).execute()
+    if not resp.data:
         raise HTTPException(status_code=404, detail="Factura no encontrada")
-    storage.write_bills(data)
 
 
 @app.patch("/api/bills/{bill_id}/toggle-paid", response_model=BillResponse)
-async def toggle_paid(bill_id: str):
-    """Alterna el estado de pago. Si pasa a pagada, registra la fecha de hoy."""
-    data = storage.read_bills()
-    for idx, b in enumerate(data["bills"]):
-        if b["id"] == bill_id:
-            new_paid = not b.get("isPaid", False)
-            data["bills"][idx]["isPaid"] = new_paid
-            data["bills"][idx]["paidDate"] = date.today().isoformat() if new_paid else None
-            storage.write_bills(data)
-            if new_paid:
-                bill = data["bills"][idx]
-                asyncio.create_task(
-                    webhook_service.fire(
-                        "bill.paid",
-                        {k: bill[k] for k in ("id", "name", "category", "amount", "dueDate", "isPaid", "source")},
-                    )
-                )
-            return data["bills"][idx]
-    raise HTTPException(status_code=404, detail="Factura no encontrada")
+async def toggle_paid(bill_id: str, current_user: dict = Depends(get_current_user)):
+    uid = current_user["id"]
+    check = (
+        supabase.table("bills").select("*").eq("id", bill_id).eq("user_id", uid).limit(1).execute()
+    )
+    if not check.data:
+        raise HTTPException(status_code=404, detail="Factura no encontrada")
+
+    current = check.data[0]
+    new_paid = not bool(current.get("is_paid", False))
+    update = {
+        "is_paid": new_paid,
+        "paid_date": date.today().isoformat() if new_paid else None,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    resp = supabase.table("bills").update(update).eq("id", bill_id).eq("user_id", uid).execute()
+    updated = BillResponse.from_supabase(resp.data[0])
+
+    if new_paid:
+        asyncio.create_task(
+            webhook_service.fire(
+                "bill.paid",
+                {"id": updated.id, "name": updated.name, "category": updated.category,
+                 "amount": updated.amount, "dueDate": updated.due_date, "source": updated.source},
+                user_id=uid,
+            )
+        )
+    return updated
 
 
 @app.get("/api/summary", response_model=list[SummaryItem])
-async def get_summary(months: int = Query(6, ge=1, le=24)):
-    """Devuelve el resumen de los últimos N meses (total y pagado por mes)."""
-    from calendar import month_name as _month_name
+async def get_summary(
+    year: Optional[int] = Query(None, ge=2000, le=2100),
+    months: Optional[int] = Query(None, ge=1, le=24),
+    current_user: dict = Depends(get_current_user),
+):
+    """Resumen de facturas.
 
-    data = storage.read_bills()
-    bills = data.get("bills", [])
+    - ?year=YYYY  → devuelve los 12 meses del año (default: año actual)
+    - ?months=N   → devuelve los últimos N meses (modo legacy, mantiene compat)
+    """
+    uid = current_user["id"]
+    resp = supabase.table("bills").select("month,amount,is_paid").eq("user_id", uid).execute()
+    bills = resp.data
 
     today = date.today()
+
+    # Modo legacy: últimos N meses
+    if months is not None and year is None:
+        result = []
+        for i in range(months - 1, -1, -1):
+            y = today.year
+            m = today.month - i
+            while m <= 0:
+                m += 12
+                y -= 1
+            month_str = f"{y:04d}-{m:02d}"
+            month_bills = [b for b in bills if b.get("month") == month_str]
+            total = sum(float(b.get("amount", 0)) for b in month_bills)
+            paid = sum(float(b.get("amount", 0)) for b in month_bills if b.get("is_paid"))
+            label = f"{_MONTHS_ES[m - 1]} {y}"
+            result.append(SummaryItem(month=month_str, label=label, total=total, paid=paid))
+        return result
+
+    # Modo año: siempre los 12 meses del año solicitado
+    target_year = year if year is not None else today.year
     result = []
-
-    for i in range(months - 1, -1, -1):
-        # Mes corriente menos i meses
-        year = today.year
-        month = today.month - i
-        while month <= 0:
-            month += 12
-            year -= 1
-        month_str = f"{year:04d}-{month:02d}"
-
+    for m in range(1, 13):
+        month_str = f"{target_year:04d}-{m:02d}"
         month_bills = [b for b in bills if b.get("month") == month_str]
-        total = sum(b.get("amount", 0) for b in month_bills)
-        paid = sum(b.get("amount", 0) for b in month_bills if b.get("isPaid"))
-
-        # Label en español, minúsculas (locale manual para evitar dependencias del OS)
-        _MONTHS_ES = [
-            "enero", "febrero", "marzo", "abril", "mayo", "junio",
-            "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre",
-        ]
-        label = f"{_MONTHS_ES[month - 1]} {year}"
-
-        result.append(SummaryItem(month=month_str, label=label, total=total, paid=paid))
-
+        total = sum(float(b.get("amount", 0)) for b in month_bills)
+        paid = sum(float(b.get("amount", 0)) for b in month_bills if b.get("is_paid"))
+        result.append(SummaryItem(month=month_str, label=_MONTHS_ES[m - 1], total=total, paid=paid))
     return result
+
+
+@app.get("/api/profile")
+async def get_profile(current_user: dict = Depends(get_current_user)):
+    """Devuelve el perfil del usuario autenticado, sincronizando avatar desde Auth metadata."""
+    uid = current_user["id"]
+    profile_resp = (
+        supabase.table("profiles")
+        .select("avatar_url,full_name,email")
+        .eq("id", uid)
+        .single()
+        .execute()
+    )
+    profile = profile_resp.data or {}
+
+    # Sincronizar avatar/nombre desde Auth metadata si no está en el profile
+    meta = current_user.get("user_metadata", {})
+    update = {}
+    if not profile.get("avatar_url") and meta.get("avatar_url"):
+        update["avatar_url"] = meta["avatar_url"]
+    if not profile.get("full_name") and meta.get("full_name"):
+        update["full_name"] = meta["full_name"]
+    if update:
+        supabase.table("profiles").update(update).eq("id", uid).execute()
+        profile.update(update)
+
+    return {
+        "id": uid,
+        "email": profile.get("email") or current_user["email"],
+        "full_name": profile.get("full_name") or meta.get("full_name"),
+        "avatar_url": profile.get("avatar_url") or meta.get("avatar_url"),
+    }
 
 
 # ─── AI scan ───────────────────────────────────────────────────────────────────
 
-ALLOWED_SCAN_TYPES = {"image/jpeg", "image/png", "application/pdf"}
-
-
 @app.post("/api/scan-invoice")
-async def scan_invoice(invoice: UploadFile = File(...)):
-    """Escanea una factura con Groq y devuelve los campos detectados. Siempre HTTP 200."""
+async def scan_invoice(
+    invoice: UploadFile = File(...),
+    current_user: dict = Depends(get_current_user),
+):
     if invoice.content_type not in ALLOWED_SCAN_TYPES:
-        raise HTTPException(
-            status_code=415,
-            detail=f"Tipo de archivo no soportado. Usá JPEG, PNG o PDF.",
-        )
+        raise HTTPException(status_code=415, detail="Tipo de archivo no soportado. Usá JPEG, PNG o PDF.")
     file_bytes = await invoice.read()
-    result = await groq_service.scan_invoice(file_bytes, invoice.content_type)
-    return result
+    return await groq_service.scan_invoice(file_bytes, invoice.content_type)
 
 
 # ─── Notifications ─────────────────────────────────────────────────────────────
 
 @app.get("/api/notifications/config")
-async def notifications_config():
-    data = storage.read_bills()
+async def notifications_config(current_user: dict = Depends(get_current_user)):
+    uid = current_user["id"]
+    profile = (
+        supabase.table("profiles")
+        .select("notifications_enabled,telegram_chat_id")
+        .eq("id", uid)
+        .single()
+        .execute()
+    )
+    data = profile.data or {}
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
     return {
-        "enabled": data.get("meta", {}).get("notifications_enabled", True),
-        "telegram_configured": bool(token and chat_id),
+        "enabled": data.get("notifications_enabled", True),
+        "telegram_configured": bool(token and data.get("telegram_chat_id")),
+        "telegram_chat_id": data.get("telegram_chat_id"),
     }
 
 
+@app.patch("/api/notifications/config")
+async def update_notifications_config(
+    body: dict, current_user: dict = Depends(get_current_user)
+):
+    uid = current_user["id"]
+    update = {}
+    if "notifications_enabled" in body:
+        update["notifications_enabled"] = bool(body["notifications_enabled"])
+    if "telegram_chat_id" in body:
+        update["telegram_chat_id"] = body["telegram_chat_id"] or None
+    if update:
+        supabase.table("profiles").update(update).eq("id", uid).execute()
+    return {"ok": True}
+
 
 @app.post("/api/notifications/test")
-async def notifications_test():
+async def notifications_test(current_user: dict = Depends(get_current_user)):
+    uid = current_user["id"]
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    profile = (
+        supabase.table("profiles")
+        .select("telegram_chat_id")
+        .eq("id", uid)
+        .single()
+        .execute()
+    )
+    chat_id = ((profile.data or {}).get("telegram_chat_id") or "").strip()
     if not token or not chat_id:
-        return {"ok": False, "message": "Telegram no configurado (falta TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID)"}
+        return {"ok": False, "message": "Telegram no configurado (falta token del bot o tu chat_id en el perfil)"}
     try:
         from telegram import Bot
         bot = Bot(token=token)
@@ -310,33 +384,70 @@ async def notifications_test():
 
 # ─── Google Drive ───────────────────────────────────────────────────────────────
 
-
-@app.get("/api/drive/oauth/callback")
-async def drive_oauth_callback(code: str):
-    drive_service.exchange_code(code)
-    return RedirectResponse(url=f"{FRONTEND_URL}/settings?drive=connected")
-
-
 @app.get("/api/drive/status")
-async def drive_status():
-    config = storage.read_json(DRIVE_CONFIG, default={})
-    connected = bool(config.get("refresh_token"))
+async def drive_status(current_user: dict = Depends(get_current_user)):
+    uid = current_user["id"]
+    profile = (
+        supabase.table("profiles")
+        .select(
+            "drive_access_token,drive_account_email,drive_folder_id,"
+            "drive_folder_name,drive_channel_expiry"
+        )
+        .eq("id", uid)
+        .single()
+        .execute()
+    )
+    data = profile.data or {}
+    expiry = data.get("drive_channel_expiry")
     return {
-        "connected": connected,
-        "folder_id": config.get("watch_folder_id"),
-        "folder_name": config.get("watch_folder_name"),
-        "account_email": config.get("account_email"),
-        "channel_expiry": config.get("channel_expiry"),
+        "connected": bool(data.get("drive_access_token")),
+        "folder_id": data.get("drive_folder_id"),
+        "folder_name": data.get("drive_folder_name"),
+        "account_email": data.get("drive_account_email"),
+        "channel_expiry": str(expiry) if expiry else None,
     }
 
 
+@app.get("/api/drive/oauth/start")
+async def drive_oauth_start(current_user: dict = Depends(get_current_user)):
+    """Inicia el flujo OAuth de Google Drive para el usuario autenticado."""
+    from jose import jwt as jose_jwt
+    state = jose_jwt.encode(
+        {"user_id": current_user["id"]},
+        os.environ.get("SUPABASE_JWT_SECRET", "secret"),
+        algorithm="HS256",
+    )
+    auth_url = drive_service.get_auth_url(state=state)
+    return {"auth_url": auth_url}
+
+
+@app.get("/api/drive/oauth/callback")
+async def drive_oauth_callback(code: str, state: str = ""):
+    """Callback OAuth de Google Drive — intercambia el code y guarda tokens en el profile."""
+    from jose import jwt as jose_jwt, JWTError
+    try:
+        payload = jose_jwt.decode(
+            state, os.environ.get("SUPABASE_JWT_SECRET", "secret"), algorithms=["HS256"]
+        )
+        user_id = payload["user_id"]
+    except (JWTError, KeyError):
+        raise HTTPException(status_code=400, detail="State OAuth inválido")
+    try:
+        await drive_service.exchange_code(code, user_id)
+    except Exception as exc:
+        logger.error("[DRIVE] exchange_code error: %s", exc)
+        return RedirectResponse(url=f"{FRONTEND_URL}/settings?drive=error")
+    return RedirectResponse(url=f"{FRONTEND_URL}/settings?drive=connected")
+
+
 @app.post("/api/drive/set-folder")
-async def drive_set_folder(body: dict):
+async def drive_set_folder(body: dict, current_user: dict = Depends(get_current_user)):
+    uid = current_user["id"]
     folder_id = body.get("folder_id", "").strip()
     if not folder_id:
         raise HTTPException(status_code=400, detail="folder_id requerido")
     try:
-        service = drive_service.get_drive_service()
+        service = await drive_service.get_drive_service(uid)
         folder = service.files().get(fileId=folder_id, fields="name,mimeType").execute()
         if "folder" not in folder.get("mimeType", ""):
             raise HTTPException(status_code=400, detail="El ID no corresponde a una carpeta")
@@ -347,48 +458,108 @@ async def drive_set_folder(body: dict):
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Carpeta inaccesible: {exc}")
 
-    await drive_service.stop_watch_channel()
-    await drive_service.create_watch_channel(folder_id)
-    config = storage.read_json(DRIVE_CONFIG, default={})
-    return {"ok": True, "folder_name": config.get("watch_folder_name", folder_id)}
+    await drive_service.stop_watch_channel(uid)
+    await drive_service.create_watch_channel(folder_id, uid)
+    profile_resp = (
+        supabase.table("profiles")
+        .select("drive_folder_name")
+        .eq("id", uid)
+        .single()
+        .execute()
+    )
+    folder_name = (profile_resp.data or {}).get("drive_folder_name", folder_id)
+    return {"ok": True, "folder_name": folder_name}
 
 
 @app.post("/api/drive/disconnect")
-async def drive_disconnect():
-    await drive_service.stop_watch_channel()
-    import pathlib
-    pathlib.Path(DRIVE_CONFIG).unlink(missing_ok=True)
+async def drive_disconnect(current_user: dict = Depends(get_current_user)):
+    uid = current_user["id"]
+    supabase.table("profiles").update({
+        "drive_access_token": None,
+        "drive_refresh_token": None,
+        "drive_token_expiry": None,
+        "drive_account_email": None,
+        "drive_folder_id": None,
+        "drive_folder_name": None,
+        "drive_channel_id": None,
+        "drive_channel_expiry": None,
+        "drive_resource_id": None,
+    }).eq("id", uid).execute()
     return {"ok": True}
 
 
 @app.post("/api/drive/webhook")
 async def drive_webhook(request: Request):
-    """Receptor de push notifications de Google Drive. Siempre devuelve HTTP 200."""
-    print(f"[DRIVE] Webhook headers: {dict(request.headers)}")
-    print(f"[DRIVE] Resource-State: {request.headers.get('x-goog-resource-state')}")
+    """Receptor de push notifications de Google Drive. Mapea channel_id → user_id via Supabase."""
     resource_state = request.headers.get("x-goog-resource-state")
     changed = request.headers.get("x-goog-changed", "")
+    channel_id = request.headers.get("x-goog-channel-id", "")
 
     if resource_state == "sync":
         return {"ok": True}
 
-    if resource_state in ("add", "update") and "children" in changed:
-        config = storage.read_json(DRIVE_CONFIG, default={})
-        folder_id = config.get("watch_folder_id")
-        if folder_id:
-            asyncio.create_task(drive_service.process_new_files(folder_id))
+    if resource_state in ("add", "update") and "children" in changed and channel_id:
+        profile_resp = (
+            supabase.table("profiles")
+            .select("id,drive_folder_id")
+            .eq("drive_channel_id", channel_id)
+            .limit(1)
+            .execute()
+        )
+        if profile_resp.data:
+            profile = profile_resp.data[0]
+            user_id = profile["id"]
+            folder_id = profile["drive_folder_id"]
+            if folder_id:
+                asyncio.create_task(drive_service.process_new_files(folder_id, user_id))
 
     return {"ok": True}
+
+
+@app.post("/api/drive/upload")
+async def drive_upload(
+    file: UploadFile = File(...),
+    current_user: dict = Depends(get_current_user),
+):
+    """Sube archivo a Drive del usuario, lo escanea con IA y retorna datos detectados."""
+    uid = current_user["id"]
+    if file.content_type not in ALLOWED_SCAN_TYPES:
+        raise HTTPException(status_code=415, detail="Tipo de archivo no soportado. Usá JPEG, PNG o PDF.")
+
+    file_bytes = await file.read()
+
+    profile_resp = (
+        supabase.table("profiles")
+        .select("drive_folder_id,drive_access_token")
+        .eq("id", uid)
+        .single()
+        .execute()
+    )
+    profile_data = profile_resp.data or {}
+    if not profile_data.get("drive_access_token"):
+        raise HTTPException(status_code=400, detail="Drive no configurado")
+    if not profile_data.get("drive_folder_id"):
+        raise HTTPException(status_code=400, detail="Carpeta de Drive no configurada")
+
+    drive_file_id = await drive_service.upload_file_to_drive(
+        file_bytes, file.filename or "factura", file.content_type, uid
+    )
+    scan_result = await groq_service.scan_invoice(file_bytes, file.content_type)
+
+    return {"scan": scan_result, "drive_file_id": drive_file_id}
 
 
 # ─── Webhooks salientes ────────────────────────────────────────────────────────
 
 @app.get("/api/webhooks/config")
-async def webhooks_config():
-    data = storage.read_bills()
-    meta = data.get("meta", {})
-    url = meta.get("webhook_url", "")
-    secret = meta.get("webhook_secret", "")
+async def webhooks_config(current_user: dict = Depends(get_current_user)):
+    uid = current_user["id"]
+    profile = (
+        supabase.table("profiles").select("webhook_url,webhook_secret").eq("id", uid).single().execute()
+    )
+    data = profile.data or {}
+    url = data.get("webhook_url") or ""
+    secret = data.get("webhook_secret") or ""
     return {
         "url_set": bool(url),
         "secret_set": bool(secret),
@@ -396,26 +567,62 @@ async def webhooks_config():
     }
 
 
+@app.post("/api/webhooks/save")
+async def webhooks_save(body: dict, current_user: dict = Depends(get_current_user)):
+    uid = current_user["id"]
+    update = {}
+    if "webhook_url" in body:
+        update["webhook_url"] = body["webhook_url"] or None
+    if "webhook_secret" in body:
+        update["webhook_secret"] = body["webhook_secret"] or None
+    if update:
+        supabase.table("profiles").update(update).eq("id", uid).execute()
+    return {"ok": True}
+
 
 @app.post("/api/webhooks/test")
-async def webhooks_test():
-    try:
-        await webhook_service.fire(
-            "webhook.test",
-            {"message": "Test desde MisFacturas", "timestamp": datetime.now(timezone.utc).isoformat()},
-        )
-        log = storage.read_json(WEBHOOK_LOG, default=[])
-        last = log[-1] if log else {}
-        return {
-            "ok": last.get("error") is None,
-            "status_code": last.get("status_code"),
-            "error": last.get("error"),
-        }
-    except Exception as exc:
-        return {"ok": False, "status_code": None, "error": str(exc)}
+async def webhooks_test(current_user: dict = Depends(get_current_user)):
+    uid = current_user["id"]
+    profile = (
+        supabase.table("profiles").select("webhook_url,webhook_secret").eq("id", uid).single().execute()
+    )
+    data = profile.data or {}
+    url = (data.get("webhook_url") or "").strip()
+    secret = (data.get("webhook_secret") or "").strip()
+
+    if not url:
+        return {"ok": False, "status_code": None, "error": "No hay webhook URL configurada"}
+
+    await webhook_service.fire(
+        "webhook.test",
+        {"message": "Test desde MisFacturas", "timestamp": datetime.now(timezone.utc).isoformat()},
+        url=url, secret=secret, user_id=uid,
+    )
+    log_resp = (
+        supabase.table("webhook_logs")
+        .select("*")
+        .eq("user_id", uid)
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    last = log_resp.data[0] if log_resp.data else {}
+    return {
+        "ok": last.get("error") is None,
+        "status_code": last.get("status_code"),
+        "error": last.get("error"),
+    }
 
 
 @app.get("/api/webhooks/log")
-async def webhooks_log():
-    log = storage.read_json(WEBHOOK_LOG, default=[])
-    return log[-10:]
+async def webhooks_log(current_user: dict = Depends(get_current_user)):
+    uid = current_user["id"]
+    resp = (
+        supabase.table("webhook_logs")
+        .select("*")
+        .eq("user_id", uid)
+        .order("created_at", desc=True)
+        .limit(10)
+        .execute()
+    )
+    return resp.data

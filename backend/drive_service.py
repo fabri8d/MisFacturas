@@ -1,6 +1,7 @@
 """Integración con Google Drive v2 — tokens OAuth por usuario en Supabase.
 
 Cada usuario tiene sus propios tokens guardados en la tabla profiles.
+Incluye organización automática en subcarpetas año/mes/tipo.
 """
 
 import asyncio
@@ -22,6 +23,12 @@ from constants import CATEGORIES
 from supabase_client import supabase
 
 logger = logging.getLogger(__name__)
+
+MONTHS_ES = {
+    1: "Enero", 2: "Febrero", 3: "Marzo", 4: "Abril",
+    5: "Mayo", 6: "Junio", 7: "Julio", 8: "Agosto",
+    9: "Septiembre", 10: "Octubre", 11: "Noviembre", 12: "Diciembre",
+}
 
 APP_BASE_URL = os.getenv("APP_BASE_URL", "")
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
@@ -251,7 +258,10 @@ async def _do_process_new_files(folder_id: str, user_id: str) -> None:
             result = await groq_service.scan_invoice(file_bytes, mime_type)
 
             if result.get("name") and result.get("amount") is not None:
-                due = result.get("dueDate") or date.today().isoformat()
+                due = result.get("dueDate") or None
+                detected_date = bool(due)
+                due = due or date.today().isoformat()
+
                 row = {
                     "user_id": user_id,
                     "name": result["name"],
@@ -264,6 +274,27 @@ async def _do_process_new_files(folder_id: str, user_id: str) -> None:
                     "source": "drive",
                     "drive_file_id": file_id,
                 }
+
+                # Organizar en subcarpeta si se detectó la fecha
+                profile = get_user_profile(user_id)
+                root_folder_id = profile.get("drive_folder_id") or folder_id
+                if detected_date:
+                    try:
+                        dest_folder_id = get_month_folder(
+                            root_folder_id, date.fromisoformat(due), "Facturas", service
+                        )
+                        updated = move_file(file_id, dest_folder_id, folder_id, service)
+                        row["drive_folder_id"] = dest_folder_id
+                        row["drive_web_view_link"] = updated.get("webViewLink")
+                    except Exception as e:
+                        logger.warning("[DRIVE] No se pudo mover archivo: %s", e)
+                else:
+                    # Sin fecha: renombrar con prefijo para identificar
+                    try:
+                        rename_file(file_id, f"SIN-FECHA-{filename}", service)
+                    except Exception as e:
+                        logger.warning("[DRIVE] No se pudo renombrar archivo: %s", e)
+
                 bill_resp = supabase.table("bills").insert(row).execute()
                 new_bill = bill_resp.data[0] if bill_resp.data else row
 
@@ -308,27 +339,119 @@ async def _do_process_new_files(folder_id: str, user_id: str) -> None:
         logger.error("[DRIVE] process_new_files error user %s: %s", user_id[:8], exc)
 
 
-async def upload_file_to_drive(
-    file_bytes: bytes, filename: str, mime_type: str, user_id: str
-) -> str:
-    """Sube un archivo a la carpeta configurada del usuario en Drive. Retorna el file_id."""
-    service = await get_drive_service(user_id)
+# ─── Helpers de organización en subcarpetas ────────────────────────────────────
 
-    profile_resp = (
+def get_or_create_folder(parent_id: str, name: str, service) -> str:
+    """Busca una carpeta por nombre dentro de parent_id. La crea si no existe."""
+    query = (
+        f"name='{name}' and '{parent_id}' in parents "
+        f"and mimeType='application/vnd.google-apps.folder' "
+        f"and trashed=false"
+    )
+    result = service.files().list(q=query, fields="files(id,name)", pageSize=1).execute()
+    if result.get("files"):
+        return result["files"][0]["id"]
+
+    folder = service.files().create(
+        body={"name": name, "mimeType": "application/vnd.google-apps.folder", "parents": [parent_id]},
+        fields="id",
+    ).execute()
+    return folder["id"]
+
+
+def get_month_folder(root_folder_id: str, due_date: date, subfolder: str, service) -> str:
+    """Crea o retorna la carpeta año/mes/subfolder. subfolder = 'Facturas' | 'Comprobantes'."""
+    year_id  = get_or_create_folder(root_folder_id, str(due_date.year), service)
+    month_name = f"{due_date.month:02d} - {MONTHS_ES[due_date.month]}"
+    month_id = get_or_create_folder(year_id, month_name, service)
+    return get_or_create_folder(month_id, subfolder, service)
+
+
+def move_file(file_id: str, new_parent_id: str, old_parent_id: str, service) -> dict:
+    """Mueve un archivo de carpeta. Retorna el file actualizado con links."""
+    return service.files().update(
+        fileId=file_id,
+        addParents=new_parent_id,
+        removeParents=old_parent_id,
+        fields="id,name,webViewLink,webContentLink",
+    ).execute()
+
+
+def rename_file(file_id: str, new_name: str, service) -> None:
+    """Renombra un archivo en Drive."""
+    service.files().update(fileId=file_id, body={"name": new_name}).execute()
+
+
+def upload_file_to_folder(
+    file_bytes: bytes, file_name: str, mime_type: str, folder_id: str, service
+) -> dict:
+    """Sube un archivo a una carpeta específica de Drive.
+    Retorna { id, name, webViewLink, webContentLink }.
+    """
+    media = MediaIoBaseUpload(BytesIO(file_bytes), mimetype=mime_type, resumable=False)
+    file_metadata = {"name": file_name, "parents": [folder_id]}
+    return service.files().create(
+        body=file_metadata,
+        media_body=media,
+        fields="id,name,webViewLink,webContentLink",
+    ).execute()
+
+
+def get_user_profile(user_id: str) -> dict:
+    """Lee el profile del usuario desde Supabase."""
+    resp = (
         supabase.table("profiles")
-        .select("drive_folder_id")
+        .select("drive_folder_id,drive_access_token,telegram_chat_id")
         .eq("id", user_id)
         .single()
         .execute()
     )
-    profile = profile_resp.data or {}
+    return resp.data or {}
+
+
+async def organize_bill_file(bill: dict, user_id: str) -> dict | None:
+    """Mueve el archivo de una factura a su subcarpeta correcta según due_date.
+
+    Retorna los campos de Drive actualizados o None si no se puede organizar.
+    """
+    if not bill.get("drive_file_id"):
+        return None
+    try:
+        service = await get_drive_service(user_id)
+        profile = get_user_profile(user_id)
+        root_folder_id = profile.get("drive_folder_id")
+        if not root_folder_id:
+            return None
+
+        due_date = date.fromisoformat(str(bill["due_date"]))
+        dest_folder_id = get_month_folder(root_folder_id, due_date, "Facturas", service)
+
+        old_parent = bill.get("drive_folder_id") or root_folder_id
+        updated = move_file(
+            file_id=bill["drive_file_id"],
+            new_parent_id=dest_folder_id,
+            old_parent_id=old_parent,
+            service=service,
+        )
+        return {
+            "drive_folder_id": dest_folder_id,
+            "drive_web_view_link": updated.get("webViewLink"),
+        }
+    except Exception as exc:
+        logger.warning("[DRIVE] organize_bill_file error: %s", exc)
+        return None
+
+
+async def upload_file_to_drive(
+    file_bytes: bytes, filename: str, mime_type: str, user_id: str
+) -> str:
+    """Compatibilidad hacia atrás — sube a la carpeta raíz del usuario. Retorna file_id."""
+    service = await get_drive_service(user_id)
+    profile = get_user_profile(user_id)
     folder_id = profile.get("drive_folder_id")
     if not folder_id:
         raise ValueError("No hay carpeta de Drive configurada para este usuario")
-
-    media = MediaIoBaseUpload(BytesIO(file_bytes), mimetype=mime_type, resumable=False)
-    file_metadata = {"name": filename, "parents": [folder_id]}
-    result = service.files().create(body=file_metadata, media_body=media, fields="id").execute()
+    result = upload_file_to_folder(file_bytes, filename, mime_type, folder_id, service)
     return result["id"]
 
 

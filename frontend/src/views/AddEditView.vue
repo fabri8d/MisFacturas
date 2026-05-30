@@ -17,7 +17,19 @@
       <div class="text-caption text-uppercase text-medium-emphasis font-weight-semibold mb-2">
         Escanear con IA
       </div>
-      <p class="text-body-2 text-medium-emphasis mb-3">
+
+      <!-- Tabs: Drive / Local -->
+      <v-tabs
+        v-if="driveConnected"
+        v-model="scanTab"
+        color="primary"
+        density="compact"
+        class="mb-3"
+      >
+        <v-tab value="drive" prepend-icon="mdi-google-drive">Escanear y subir a Drive</v-tab>
+        <v-tab value="local" prepend-icon="mdi-magnify">Solo escanear</v-tab>
+      </v-tabs>
+      <p v-else class="text-body-2 text-medium-emphasis mb-3">
         Subí una imagen o PDF para completar el formulario automáticamente.
       </p>
 
@@ -34,7 +46,21 @@
       />
 
       <div class="d-flex align-center gap-2 flex-wrap">
+        <!-- Tab Drive: escanear + archivar -->
         <v-btn
+          v-if="driveConnected && scanTab === 'drive'"
+          color="primary"
+          :loading="scanning"
+          :disabled="!scanFile"
+          prepend-icon="mdi-google-drive"
+          @click="handleScanAndUpload"
+        >
+          Escanear y archivar
+        </v-btn>
+
+        <!-- Solo escaneo (sin Drive o tab local) -->
+        <v-btn
+          v-else
           color="primary"
           :loading="scanning"
           :disabled="!scanFile"
@@ -45,17 +71,41 @@
         </v-btn>
 
         <v-chip
-          v-if="driveConnected"
+          v-if="driveConnected && scanTab === 'drive' && !pendingDriveFileId"
           size="small"
-          color="success"
+          color="primary"
           variant="tonal"
           prepend-icon="mdi-google-drive"
         >
-          Se archivará en Drive
+          Se archivará en Drive automáticamente
         </v-chip>
-        <span v-else class="text-caption text-medium-emphasis">Solo escaneo local</span>
       </div>
+
+      <!-- Confirmación de archivo subido a Drive -->
+      <v-alert
+        v-if="pendingDriveFileId"
+        type="success"
+        variant="tonal"
+        density="compact"
+        rounded="lg"
+        class="mt-3"
+      >
+        ✓ Archivo subido a Drive · Se organizará en la carpeta del mes
+      </v-alert>
     </v-card>
+
+    <!-- Link "Ver factura en Drive" en modo edición -->
+    <v-btn
+      v-if="!isNew && form.driveWebViewLink"
+      variant="outlined"
+      prepend-icon="mdi-google-drive"
+      size="small"
+      :href="form.driveWebViewLink"
+      target="_blank"
+      class="mb-4"
+    >
+      Ver factura original en Drive
+    </v-btn>
 
     <!-- Formulario -->
     <v-form ref="formRef" @submit.prevent="handleSubmit">
@@ -153,7 +203,13 @@ const form = ref({
   isPaid: false,
   paidDate: null,
   source: 'manual',
+  driveWebViewLink: null,
 })
+
+const scanTab = ref('drive')
+const pendingDriveFileId = ref(null)
+const pendingDriveFolderId = ref(null)
+const pendingDriveViewLink = ref(null)
 
 const displayDate = ref('')
 const dateError = ref('')
@@ -201,6 +257,36 @@ onMounted(async () => {
   } catch { /* opcional */ }
 })
 
+async function handleScanAndUpload() {
+  if (!scanFile.value) return showToast('Seleccioná un archivo primero')
+  scanning.value = true
+  try {
+    const fd = new FormData()
+    fd.append('file', scanFile.value)
+    const res = await import('../api/client').then(m => m.default.post('/drive/upload', fd, { headers: { 'Content-Type': 'multipart/form-data' } }))
+    const result = res.scanResult || res
+
+    if (result.name)           form.value.name = result.name
+    if (result.category)       form.value.category = result.category
+    if (result.amount != null) form.value.amount = String(result.amount)
+    if (result.dueDate) {
+      form.value.dueDate = result.dueDate
+      displayDate.value = toDisplay(result.dueDate)
+    }
+    if (result.notes) form.value.notes = result.notes
+
+    pendingDriveFileId.value   = res.driveFileId || null
+    pendingDriveFolderId.value = res.driveFolderId || null
+    pendingDriveViewLink.value = res.driveWebViewLink || null
+
+    showToast('Archivo subido a Drive y escaneado correctamente', 'success')
+  } catch (e) {
+    showToast('Error al subir a Drive: ' + (e.message || e))
+  } finally {
+    scanning.value = false
+  }
+}
+
 async function handleScan() {
   if (!scanFile.value) return showToast('Seleccioná un archivo primero')
   scanning.value = true
@@ -241,6 +327,9 @@ async function handleSubmit() {
       paidDate: form.value.isPaid
         ? (form.value.paidDate || new Date().toISOString().slice(0, 10))
         : null,
+      driveFileId:      pendingDriveFileId.value || undefined,
+      driveFolderId:    pendingDriveFolderId.value || undefined,
+      driveWebViewLink: pendingDriveViewLink.value || undefined,
     }
     if (isNew.value) {
       await store.createBill(payload)

@@ -26,7 +26,7 @@ import notifier
 import webhook_service
 from auth import get_current_user
 from constants import CATEGORIES
-from models import BillCreate, BillResponse, BillUpdate, SummaryItem
+from models import BillCreate, BillResponse, BillUpdate, ReceiptResponse, SummaryItem
 from supabase_client import supabase
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -154,6 +154,13 @@ async def create_bill(bill: BillCreate, current_user: dict = Depends(get_current
         "notes": bill.notes,
         "source": bill.source,
     }
+    # Campos opcionales de Drive (cuando se sube desde la web)
+    if bill.drive_file_id:
+        row["drive_file_id"] = bill.drive_file_id
+    if bill.drive_folder_id:
+        row["drive_folder_id"] = bill.drive_folder_id
+    if bill.drive_web_view_link:
+        row["drive_web_view_link"] = bill.drive_web_view_link
     resp = supabase.table("bills").insert(row).execute()
     created = BillResponse.from_supabase(resp.data[0])
 
@@ -182,11 +189,28 @@ async def update_bill(
         row = supabase.table("bills").select("*").eq("id", bill_id).single().execute()
         return BillResponse.from_supabase(row.data)
 
-    if "due_date" in update:
+    due_date_changed = "due_date" in update
+    if due_date_changed:
         update["month"] = update["due_date"][:7]
     update["updated_at"] = datetime.now(timezone.utc).isoformat()
     resp = supabase.table("bills").update(update).eq("id", bill_id).eq("user_id", uid).execute()
-    return BillResponse.from_supabase(resp.data[0])
+    updated_bill = BillResponse.from_supabase(resp.data[0])
+
+    # Si cambió la fecha y la factura tiene archivo en Drive → reorganizar en background
+    if due_date_changed and updated_bill.drive_file_id:
+        bill_dict = resp.data[0]
+        asyncio.create_task(
+            _reorganize_bill_file_background(bill_dict, uid)
+        )
+
+    return updated_bill
+
+
+async def _reorganize_bill_file_background(bill: dict, user_id: str) -> None:
+    """Reorganiza el archivo en Drive tras un cambio de fecha. No bloquea la respuesta."""
+    drive_updates = await drive_service.organize_bill_file(bill, user_id)
+    if drive_updates:
+        supabase.table("bills").update(drive_updates).eq("id", bill["id"]).execute()
 
 
 @app.delete("/api/bills/{bill_id}", status_code=204)
@@ -521,32 +545,54 @@ async def drive_upload(
     file: UploadFile = File(...),
     current_user: dict = Depends(get_current_user),
 ):
-    """Sube archivo a Drive del usuario, lo escanea con IA y retorna datos detectados."""
+    """Sube una factura desde la web a Drive, la escanea y retorna datos para el formulario."""
     uid = current_user["id"]
-    if file.content_type not in ALLOWED_SCAN_TYPES:
+    max_size = 20 * 1024 * 1024  # 20 MB
+
+    allowed_types = {"image/jpeg", "image/png", "image/webp", "application/pdf"}
+    if file.content_type not in allowed_types:
         raise HTTPException(status_code=415, detail="Tipo de archivo no soportado. Usá JPEG, PNG o PDF.")
 
     file_bytes = await file.read()
+    if len(file_bytes) > max_size:
+        raise HTTPException(status_code=413, detail="Archivo demasiado grande (máximo 20 MB)")
 
-    profile_resp = (
-        supabase.table("profiles")
-        .select("drive_folder_id,drive_access_token")
-        .eq("id", uid)
-        .single()
-        .execute()
-    )
-    profile_data = profile_resp.data or {}
+    profile_data = drive_service.get_user_profile(uid)
     if not profile_data.get("drive_access_token"):
         raise HTTPException(status_code=400, detail="Drive no configurado")
-    if not profile_data.get("drive_folder_id"):
+    root_folder_id = profile_data.get("drive_folder_id")
+    if not root_folder_id:
         raise HTTPException(status_code=400, detail="Carpeta de Drive no configurada")
 
-    drive_file_id = await drive_service.upload_file_to_drive(
-        file_bytes, file.filename or "factura", file.content_type, uid
-    )
+    service = await drive_service.get_drive_service(uid)
+
+    # Escanear con IA
     scan_result = await groq_service.scan_invoice(file_bytes, file.content_type)
 
-    return {"scan": scan_result, "drive_file_id": drive_file_id}
+    # Determinar carpeta de destino según fecha detectada
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    safe_name = f"{ts}-{file.filename or 'factura'}"
+
+    if scan_result.get("dueDate"):
+        try:
+            due = date.fromisoformat(scan_result["dueDate"])
+            folder_id = drive_service.get_month_folder(root_folder_id, due, "Facturas", service)
+        except Exception:
+            folder_id = root_folder_id
+    else:
+        folder_id = root_folder_id
+        safe_name = f"SIN-FECHA-{safe_name}"
+
+    drive_file = drive_service.upload_file_to_folder(
+        file_bytes, safe_name, file.content_type, folder_id, service
+    )
+
+    return {
+        "scanResult": scan_result,
+        "driveFileId": drive_file["id"],
+        "driveFolderId": folder_id,
+        "driveWebViewLink": drive_file.get("webViewLink"),
+    }
 
 
 # ─── Webhooks salientes ────────────────────────────────────────────────────────
@@ -626,3 +672,195 @@ async def webhooks_log(current_user: dict = Depends(get_current_user)):
         .execute()
     )
     return resp.data
+
+
+# ─── Comprobantes de pago ───────────────────────────────────────────────────────
+
+ALLOWED_RECEIPT_TYPES = {"image/jpeg", "image/png", "image/webp", "application/pdf"}
+MAX_RECEIPT_SIZE = 10 * 1024 * 1024  # 10 MB
+
+
+@app.get("/api/bills/receipts/summary")
+async def receipts_summary(current_user: dict = Depends(get_current_user)):
+    """Conteo de comprobantes por factura del usuario. { bill_id: count }"""
+    uid = current_user["id"]
+    resp = (
+        supabase.table("receipts")
+        .select("bill_id")
+        .eq("user_id", uid)
+        .execute()
+    )
+    counts: dict = {}
+    for row in (resp.data or []):
+        bid = str(row["bill_id"])
+        counts[bid] = counts.get(bid, 0) + 1
+    return counts
+
+
+@app.post("/api/bills/{bill_id}/receipts", status_code=201)
+async def upload_receipt(
+    bill_id: str,
+    file: UploadFile = File(...),
+    current_user: dict = Depends(get_current_user),
+):
+    """Sube un comprobante de pago a Drive y lo vincula con la factura."""
+    uid = current_user["id"]
+
+    # Verificar ownership
+    bill_resp = (
+        supabase.table("bills")
+        .select("*")
+        .eq("id", bill_id)
+        .eq("user_id", uid)
+        .single()
+        .execute()
+    )
+    if not bill_resp.data:
+        raise HTTPException(status_code=404, detail="Factura no encontrada")
+    bill = bill_resp.data
+
+    # Validaciones
+    if file.content_type not in ALLOWED_RECEIPT_TYPES:
+        raise HTTPException(status_code=415, detail="Tipo de archivo no soportado. Usá JPEG, PNG o PDF.")
+
+    file_bytes = await file.read()
+    if len(file_bytes) > MAX_RECEIPT_SIZE:
+        raise HTTPException(status_code=413, detail="Archivo demasiado grande (máximo 10 MB)")
+
+    if not bill.get("due_date"):
+        raise HTTPException(
+            status_code=400,
+            detail="La factura no tiene fecha de vencimiento. "
+                   "Editá la factura para agregar la fecha antes de subir el comprobante.",
+        )
+
+    # Verificar Drive conectado
+    profile = drive_service.get_user_profile(uid)
+    if not profile.get("drive_access_token"):
+        raise HTTPException(status_code=400, detail="Drive no conectado. Configuralo en Ajustes.")
+    root_folder_id = profile.get("drive_folder_id")
+    if not root_folder_id:
+        raise HTTPException(status_code=400, detail="Carpeta de Drive no configurada.")
+
+    # Obtener carpeta Comprobantes/mes
+    service = await drive_service.get_drive_service(uid)
+    due = date.fromisoformat(str(bill["due_date"]))
+    folder_id = drive_service.get_month_folder(root_folder_id, due, "Comprobantes", service)
+
+    # Subir a Drive con timestamp para evitar colisiones
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    safe_name = f"{ts}-{file.filename or 'comprobante'}"
+    drive_file = drive_service.upload_file_to_folder(
+        file_bytes, safe_name, file.content_type, folder_id, service
+    )
+
+    # Guardar en tabla receipts
+    receipt_row = {
+        "user_id": uid,
+        "bill_id": bill_id,
+        "drive_file_id": drive_file["id"],
+        "drive_folder_id": folder_id,
+        "file_name": file.filename or safe_name,
+        "file_size": len(file_bytes),
+        "mime_type": file.content_type,
+        "drive_web_view_link": drive_file.get("webViewLink"),
+        "drive_web_content_link": drive_file.get("webContentLink"),
+    }
+    ins = supabase.table("receipts").insert(receipt_row).execute()
+    receipt = ins.data[0]
+
+    # Marcar factura como pagada si no lo estaba
+    was_paid = bool(bill.get("is_paid"))
+    if not was_paid:
+        supabase.table("bills").update({
+            "is_paid": True,
+            "paid_date": date.today().isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("id", bill_id).execute()
+
+    return ReceiptResponse.from_supabase(receipt)
+
+
+@app.get("/api/bills/{bill_id}/receipts")
+async def list_receipts(
+    bill_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Lista todos los comprobantes de una factura."""
+    uid = current_user["id"]
+
+    check = (
+        supabase.table("bills").select("id").eq("id", bill_id).eq("user_id", uid).limit(1).execute()
+    )
+    if not check.data:
+        raise HTTPException(status_code=404, detail="Factura no encontrada")
+
+    resp = (
+        supabase.table("receipts")
+        .select("*")
+        .eq("bill_id", bill_id)
+        .eq("user_id", uid)
+        .order("uploaded_at", desc=True)
+        .execute()
+    )
+    return [ReceiptResponse.from_supabase(r) for r in (resp.data or [])]
+
+
+@app.delete("/api/bills/{bill_id}/receipts/{receipt_id}", status_code=204)
+async def delete_receipt(
+    bill_id: str,
+    receipt_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Elimina un comprobante de Drive y de Supabase."""
+    uid = current_user["id"]
+
+    # Verificar ownership del bill y del receipt
+    r_resp = (
+        supabase.table("receipts")
+        .select("*")
+        .eq("id", receipt_id)
+        .eq("bill_id", bill_id)
+        .eq("user_id", uid)
+        .single()
+        .execute()
+    )
+    if not r_resp.data:
+        raise HTTPException(status_code=404, detail="Comprobante no encontrado")
+    receipt = r_resp.data
+
+    # Eliminar de Drive (silencioso si ya no existe)
+    try:
+        service = await drive_service.get_drive_service(uid)
+        service.files().delete(fileId=receipt["drive_file_id"]).execute()
+    except Exception as exc:
+        logger.warning("[RECEIPTS] No se pudo eliminar de Drive: %s", exc)
+
+    # Eliminar de Supabase
+    supabase.table("receipts").delete().eq("id", receipt_id).execute()
+
+
+@app.post("/api/bills/{bill_id}/drive-organize")
+async def drive_organize_bill(
+    bill_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Reorganiza manualmente el archivo de una factura en Drive según su fecha."""
+    uid = current_user["id"]
+    bill_resp = (
+        supabase.table("bills").select("*").eq("id", bill_id).eq("user_id", uid).single().execute()
+    )
+    if not bill_resp.data:
+        raise HTTPException(status_code=404, detail="Factura no encontrada")
+
+    bill = bill_resp.data
+    if not bill.get("drive_file_id"):
+        return {"ok": False, "reason": "La factura no tiene archivo en Drive"}
+    if not bill.get("due_date"):
+        return {"ok": False, "reason": "La factura no tiene fecha de vencimiento"}
+
+    drive_updates = await drive_service.organize_bill_file(bill, uid)
+    if drive_updates:
+        supabase.table("bills").update(drive_updates).eq("id", bill_id).execute()
+        return {"ok": True, "driveWebViewLink": drive_updates.get("drive_web_view_link")}
+    return {"ok": False, "reason": "No se pudo reorganizar el archivo"}

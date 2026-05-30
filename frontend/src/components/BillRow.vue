@@ -25,19 +25,29 @@
         <v-chip :color="chipColor" variant="tonal" size="x-small">
           {{ status.label }}
         </v-chip>
-        <div v-if="showActions" class="d-flex" style="gap:2px; margin-top:2px">
+        <ReceiptChip :billId="bill.id" @view="emit('open-receipts', bill)" />
+        <div class="d-flex" style="gap:2px; margin-top:2px">
           <v-btn
+            v-if="showActions"
             icon="mdi-pencil-outline"
             variant="text"
             size="x-small"
             @click.stop="emit('edit')"
           />
           <v-btn
+            v-if="showActions"
             icon="mdi-delete-outline"
             variant="text"
             size="x-small"
             color="error"
             @click.stop="emit('delete')"
+          />
+          <v-btn
+            icon="mdi-paperclip"
+            variant="text"
+            size="x-small"
+            color="primary"
+            @click.stop="emit('open-receipts', bill)"
           />
         </div>
       </div>
@@ -55,12 +65,13 @@
 <script setup>
 import { computed } from 'vue'
 import { CATEGORIES } from '../constants/categories'
+import ReceiptChip from './ReceiptChip.vue'
 
 const props = defineProps({
   bill:        { type: Object,  required: true },
   showActions: { type: Boolean, default: false },
 })
-const emit = defineEmits(['toggle', 'edit', 'delete'])
+const emit = defineEmits(['toggle', 'edit', 'delete', 'open-receipts'])
 
 const fmt = (n) =>
   new Intl.NumberFormat('es-AR', { style: 'currency', currency: 'ARS' }).format(n)

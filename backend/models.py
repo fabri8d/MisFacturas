@@ -38,6 +38,9 @@ class BillCreate(BaseModel):
     is_paid: bool = Field(False, alias="isPaid")
     paid_date: Optional[str] = Field(None, alias="paidDate", pattern=r"^\d{4}-\d{2}-\d{2}$")
     source: SourceKey = "manual"
+    drive_file_id: Optional[str] = Field(None, alias="driveFileId")
+    drive_folder_id: Optional[str] = Field(None, alias="driveFolderId")
+    drive_web_view_link: Optional[str] = Field(None, alias="driveWebViewLink")
 
     @field_validator("category", mode="before")
     @classmethod
@@ -88,6 +91,7 @@ class BillResponse(BaseModel):
     notes: Optional[str]
     source: str
     drive_file_id: Optional[str] = None
+    drive_web_view_link: Optional[str] = None
     created_at: str
 
     @classmethod
@@ -115,6 +119,7 @@ class BillResponse(BaseModel):
             notes=row.get("notes"),
             source=row.get("source", "manual"),
             drive_file_id=row.get("drive_file_id"),
+            drive_web_view_link=row.get("drive_web_view_link"),
             created_at=_str(row.get("created_at", "")),
         )
 
@@ -126,3 +131,38 @@ class SummaryItem(BaseModel):
     label: str      # "mayo 2025" (locale es-AR, minúsculas)
     total: float
     paid: float
+
+
+class ReceiptResponse(BaseModel):
+    """Comprobante de pago (referencia a archivo en Google Drive)."""
+
+    id: str
+    billId: str
+    fileName: str
+    fileSize: Optional[int]
+    mimeType: Optional[str]
+    driveFileId: str
+    driveWebViewLink: Optional[str]
+    driveWebContentLink: Optional[str]
+    uploadedAt: str
+
+    @classmethod
+    def from_supabase(cls, row: dict) -> "ReceiptResponse":
+        def _str(v) -> str:
+            if v is None:
+                return ""
+            if hasattr(v, "isoformat"):
+                return v.isoformat()
+            return str(v)
+
+        return cls(
+            id=str(row["id"]),
+            billId=str(row["bill_id"]),
+            fileName=row["file_name"],
+            fileSize=row.get("file_size"),
+            mimeType=row.get("mime_type"),
+            driveFileId=row["drive_file_id"],
+            driveWebViewLink=row.get("drive_web_view_link"),
+            driveWebContentLink=row.get("drive_web_content_link"),
+            uploadedAt=_str(row.get("uploaded_at", "")),
+        )

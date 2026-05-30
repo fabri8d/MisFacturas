@@ -119,6 +119,14 @@ export const useBillsStore = defineStore('bills', () => {
     }
   }
 
+  function markPaid(billId) {
+    const bill = bills.value.find((b) => b.id === billId)
+    if (bill && !bill.isPaid) {
+      bill.isPaid = true
+      bill.paidDate = new Date().toISOString().slice(0, 10)
+    }
+  }
+
   async function togglePaid(id) {
     try {
       const updated = await client.patch(`/bills/${id}/toggle-paid`)
@@ -195,6 +203,7 @@ export const useBillsStore = defineStore('bills', () => {
     deleteBill,
     togglePaid,
     scanInvoice,
+    markPaid,
     fetchSummary,
     setSummaryYear,
     fetchNotificationsConfig,

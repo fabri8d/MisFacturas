@@ -30,6 +30,7 @@
               :bill="bill"
               @toggle="handleToggle(bill)"
               @edit="router.push('/bills/' + bill.id)"
+              @open-receipts="openReceipts"
             />
           </v-list>
         </section>
@@ -148,6 +149,14 @@
     </template>
 
     <ToastNotif v-bind="toast" @close="toast.visible = false" />
+
+    <ReceiptPanel
+      v-model="receiptPanelOpen"
+      :billId="selectedBill?.id"
+      :billName="selectedBill?.name"
+      :billDueDate="selectedBill?.dueDate"
+      :hasDrive="driveConnected"
+    />
   </div>
 </template>
 
@@ -156,17 +165,23 @@ import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useDisplay } from 'vuetify'
 import BillRow from '../components/BillRow.vue'
+import ReceiptPanel from '../components/ReceiptPanel.vue'
 import MonthNav from '../components/MonthNav.vue'
 import ProgressBar from '../components/ProgressBar.vue'
 import StatCard from '../components/StatCard.vue'
 import ToastNotif from '../components/ToastNotif.vue'
 import { CATEGORIES } from '../constants/categories'
 import { useBillsStore } from '../stores/bills'
+import { useReceiptsStore } from '../stores/receipts'
 
 const store = useBillsStore()
+const receiptsStore = useReceiptsStore()
 const router = useRouter()
 const { mdAndUp } = useDisplay()
 const toast = ref({ visible: false, message: '', type: 'info' })
+const receiptPanelOpen = ref(false)
+const selectedBill = ref(null)
+const driveConnected = ref(false)
 
 const fmt = (n) =>
   new Intl.NumberFormat('es-AR', { style: 'currency', currency: 'ARS' }).format(n)
@@ -175,7 +190,19 @@ function showToast(message, type = 'error') {
   toast.value = { visible: true, message, type }
 }
 
-onMounted(() => store.fetchBills())
+onMounted(async () => {
+  store.fetchBills()
+  receiptsStore.fetchReceiptCounts()
+  try {
+    const drive = await store.fetchDriveStatus()
+    driveConnected.value = drive.connected && !!drive.folder_id
+  } catch { /* opcional */ }
+})
+
+function openReceipts(bill) {
+  selectedBill.value = bill
+  receiptPanelOpen.value = true
+}
 
 async function handleToggle(bill) {
   try { await store.togglePaid(bill.id) }

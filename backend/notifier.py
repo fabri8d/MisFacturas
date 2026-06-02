@@ -6,7 +6,7 @@ El job diario itera por todos los usuarios con Telegram configurado.
 
 import logging
 import os
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import Bot
@@ -167,6 +167,15 @@ def _fmt_date(date_str: str) -> str:
         return date_str
 
 
+async def renew_drive_channels_job() -> None:
+    """Renueva canales de Drive por vencer. Corre cada 12 horas."""
+    try:
+        import drive_service
+        await drive_service.renew_expiring_channels()
+    except Exception as exc:
+        logger.error("[NOTIFIER] renew_drive_channels error: %s", exc)
+
+
 def start_scheduler() -> None:
     scheduler.add_job(
         daily_notification_job,
@@ -182,6 +191,14 @@ def start_scheduler() -> None:
         days=3,
         id="supabase_keepalive",
         replace_existing=True,
+    )
+    scheduler.add_job(
+        renew_drive_channels_job,
+        "interval",
+        hours=12,
+        id="renew_drive_channels",
+        replace_existing=True,
+        next_run_time=datetime.now(timezone.utc),
     )
     scheduler.start()
     logger.info("[NOTIFIER] Scheduler iniciado — notificaciones a las %02d:00 ART", NOTIFY_HOUR)

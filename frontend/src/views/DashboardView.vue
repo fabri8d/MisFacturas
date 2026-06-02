@@ -129,6 +129,7 @@
             :bill="bill"
             @toggle="handleToggle(bill)"
             @edit="router.push('/bills/' + bill.id)"
+            @open-receipts="openReceipts"
           />
         </v-list>
       </section>
@@ -143,6 +144,7 @@
             :key="bill.id"
             :bill="bill"
             @toggle="handleToggle(bill)"
+            @open-receipts="openReceipts"
           />
         </v-list>
       </section>

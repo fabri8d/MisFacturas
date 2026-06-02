@@ -206,20 +206,21 @@ async def _do_process_new_files(folder_id: str, user_id: str) -> None:
         service = await get_drive_service(user_id)
         logger.info("[DRIVE] Buscando archivos en carpeta %s para user %s", folder_id, user_id[:8])
 
+        mime_filter = (
+            "mimeType='image/jpeg' or mimeType='image/png' or mimeType='application/pdf'"
+        )
         results = (
             service.files()
             .list(
-                q=f"'{folder_id}' in parents and trashed=false",
+                q=f"'{folder_id}' in parents and trashed=false and ({mime_filter})",
                 orderBy="modifiedTime desc",
                 fields="files(id,name,mimeType,modifiedTime)",
-                pageSize=5,
+                pageSize=50,
             )
             .execute()
         )
 
-        all_files = results.get("files", [])
-        allowed_types = {"image/jpeg", "image/png", "application/pdf"}
-        filtered = [f for f in all_files if f.get("mimeType") in allowed_types]
+        filtered = results.get("files", [])
 
         # Cargar drive_file_ids ya procesados para este usuario
         existing_resp = (
@@ -440,6 +441,45 @@ async def organize_bill_file(bill: dict, user_id: str) -> dict | None:
     except Exception as exc:
         logger.warning("[DRIVE] organize_bill_file error: %s", exc)
         return None
+
+
+async def renew_expiring_channels() -> None:
+    """Renueva canales de Drive que expiran en menos de 24 horas."""
+    threshold = datetime.now(timezone.utc) + timedelta(hours=24)
+    profiles_resp = (
+        supabase.table("profiles")
+        .select("id,drive_folder_id,drive_channel_expiry")
+        .not_.is_("drive_folder_id", "null")
+        .not_.is_("drive_channel_id", "null")
+        .execute()
+    )
+    for profile in (profiles_resp.data or []):
+        user_id = profile["id"]
+        folder_id = profile.get("drive_folder_id")
+        expiry_str = profile.get("drive_channel_expiry")
+        if not folder_id:
+            continue
+
+        should_renew = False
+        if not expiry_str:
+            # Sin fecha guardada → renovar por precaución
+            should_renew = True
+        else:
+            try:
+                expiry = datetime.fromisoformat(str(expiry_str))
+                if expiry.tzinfo is None:
+                    expiry = expiry.replace(tzinfo=timezone.utc)
+                should_renew = expiry < threshold
+            except (ValueError, TypeError):
+                should_renew = True
+
+        if should_renew:
+            logger.info("[DRIVE] Renovando canal — user %s (expiry=%s)", user_id[:8], expiry_str)
+            try:
+                await stop_watch_channel(user_id)
+                await create_watch_channel(folder_id, user_id)
+            except Exception as exc:
+                logger.error("[DRIVE] Error renovando canal user %s: %s", user_id[:8], exc)
 
 
 async def upload_file_to_drive(
